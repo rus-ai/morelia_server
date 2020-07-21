@@ -13,6 +13,8 @@ class User(orm.SQLObject):
     email = orm.StringCol(default=None)
     avatar = orm.BLOBCol(default=None)
     bio = orm.StringCol(default=None)
+    salt = orm.StringCol(default=None)
+    key = orm.StringCol(default=None)
 
 
 class Flow(orm.SQLObject):
