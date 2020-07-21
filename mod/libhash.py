@@ -58,3 +58,7 @@ def check_password(hash_password: bytes, password: str,
     result = blake2b(data, digest_size=size, key=key, salt=salt)
     good_password = result.hexdigest()
     return compare_digest(hash_password, good_password.encode('utf-8'))
+
+
+if __name__ == "__main__":
+    print('Error! This module should be imported, not started.')
