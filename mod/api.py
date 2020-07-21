@@ -7,8 +7,6 @@ from pydantic import BaseModel
 from pydantic import ValidationError
 from pydantic import EmailStr
 
-from mod import config
-
 
 dict_json = {
     'type': 'user_info',
@@ -66,18 +64,16 @@ dict_json = {
         'detail': 'successfully'
         },
     'jsonapi': {
-        'version': config.API_VERSION
+        'version': 1.0
         },
     'meta': None
     }
-
-encode_json = json.JSONEncoder().encode(dict_json)
 
 
 class EditedMessage(BaseModel):
     class Config:
         title = 'Time of editing the message'
-    time: int
+    time: float
     status: bool
 
 
@@ -100,7 +96,7 @@ class Flow(BaseModel):
     class Config:
         title = 'List of chat rooms with their description and type'
     id: int
-    time: Optional[int] = None
+    time: Optional[float] = None
     type: Optional[str] = None
     title: Optional[str] = None
     info: Optional[str] = None
@@ -133,7 +129,7 @@ class Message(BaseModel):
     id: int
     text: Optional[str] = None
     from_user: Optional[MessageFromUser] = None
-    time: int
+    time: float
     from_chat: FromFlow = None
     file: Optional[File] = None
     emoji: Optional[bytes] = None
@@ -144,7 +140,7 @@ class Message(BaseModel):
 class Data(BaseModel):
     class Config:
         title = 'Main data-object'
-    time: Optional[int] = None
+    time: Optional[float] = None
     chat: Optional[Flow] = None
     message: Optional[Message] = None
     user: Optional[User] = None
@@ -155,7 +151,7 @@ class Errors(BaseModel):
     class Config:
         title = 'Error information and statuses of request processing'
     id: int
-    time: int
+    time: float
     status: str
     code: int
     detail: str
@@ -177,53 +173,5 @@ class ValidJSON(BaseModel):
     meta: Optional[Any] = None
 
 
-def response(obj):
-    try:
-        validate = ValidJSON.parse_raw(obj)
-    except ValidationError as error:
-        return error.json()
-    if validate.dict()['type'] == 'all_messages':
-        try:
-            result = Errors(id=validate.dict()['data']['user']['id'], time=time(), status='OK', code=200, detail='Hello')
-        except ValidationError as error:
-            result = error
-    elif validate.dict()['type'] == 'auth':
-        try:
-            result = Errors(id=validate.dict()['data']['user']['id'], time=time(), status='OK', code=200, detail='Hello')
-        except ValidationError as error:
-            result = error
-    elif validate.dict()['type'] == 'all_chat':
-        try:
-            result = Errors(id=validate.dict()['data']['user']['id'], time=time(), status='OK', code=200, detail='Hello')
-        except ValidationError as error:
-            result = error
-    elif validate.dict()['type'] == 'reg_user':
-        try:
-            result = Errors(id=validate.dict()['data']['user']['id'], time=time(), status='OK', code=200, detail='Hello')
-        except ValidationError as error:
-            result = error
-    elif validate.dict()['type'] == 'user_info':
-        try:
-            result = Errors(id=validate.dict()['data']['user']['id'], time=time(), status='OK', code=200, detail='Hello')
-        except ValidationError as error:
-            result = error
-    elif validate.dict()['type'] == 'send_message':
-        try:
-            result = Errors(id=validate.dict()['data']['user']['id'], time=time(), status='OK', code=200, detail='Hello')
-        except ValidationError as error:
-            result = error
-    elif validate.dict()['type'] == 'get_update':
-        try:
-            result = Errors(id=validate.dict()['data']['user']['id'], time=time(), status='OK', code=200, detail='Hello')
-        except ValidationError as error:
-            result = error
-    else:
-        try:
-            result = Errors(id=2, time=time(), status='ERROR', code=400, detail='Hello')
-        except ValidationError as error:
-            result = error
-    return result.json()
-
-
-print('Response=', response(encode_json))
-print('Shema=', ValidJSON.schema_json(indent=2))
+if __name__ == "__main__":
+    print('Shema=', ValidJSON.schema_json(indent=2))
