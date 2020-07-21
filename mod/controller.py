@@ -1,6 +1,11 @@
 import random
 
+from pydantic import ValidationError
+
 from mod import models
+from mod import api
+from mod import libhash
+from mod import config
 
 
 def save_userdata(username: str, password: str) -> None:
@@ -78,3 +83,53 @@ def get_messages() -> list:
                     "timestamp": data.time
                         })
     return messages
+
+
+async def auth_id() -> str:
+    pass
+
+
+async def register_user(data: dict) -> dict:
+    try:
+        data = await api.ValidJSON.parse_obj(data)
+    except ValidationError as error:
+        print(error)
+    userID = random.getrandbits(64)
+    dict_hash = libhash.password_hash(password=data.user.password)
+    try:
+        dbquery = models.User(userID=userID,
+                              login=data.user.login,
+                              password=dict_hash['hash_password'],
+                              username=data.user.username,
+                              authId=,
+                              email=data.user.email,
+                              salt=dict_hash['salt'],
+                              key=dict_hash['key'])
+    except EnvironmentError:
+        print('Error')
+    result = {
+        'type': data.type,
+        'data': {
+            'time': time(),
+            'user': {
+                'id': userID,
+                'auth_id': 'lkds89ds89fd98fd'
+                },
+            'meta': None
+        },
+        'errors': {
+            'id': 25665546,
+            'time': 1594492370.5225992,
+            'status': 'OK',
+            'code': 200,
+            'detail': 'successfully'
+            },
+        'jsonapi': {
+            'version': config.API_VERSION
+            },
+        'meta': None
+        }
+    return result
+
+if __name__ == "__main__":
+    print('Error! This module should be imported, not started.')
