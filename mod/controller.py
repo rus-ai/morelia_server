@@ -1,375 +1,429 @@
 import random
+from os import urandom
 from time import time
+from typing import Optional, Union
 
-from mod import models
-from mod import config
+from pydantic import ValidationError
+from sqlobject import AND
+from sqlobject import SQLObjectIntegrityError
+from sqlobject import SQLObjectNotFound
+from sqlobject import dberrors
+
 from mod import api
+from mod import config
+from mod import lib
+from mod import models
 
 
-def save_userdata(username: str, password: str) -> None:
-    """The function saves the user name and password to the database.
-    There is no check for the data type.
-
-    Args:
-        username (str): required
-        password (str): required
-
-    Returns:
-        None
+class ProtocolMethods:
+    """The class is responsible for processing requests and forming answers
+    according to "Udav" protocol. Protocol version and it's actual description:
+    https://github.com/MoreliaTalk/morelia_protocol/blob/master/README.md
     """
-    userID = random.getrandbits(64)
-    models.User(UUID=userID,
-                password=password,
-                login=username,
-                username=username)
-    return
+    def __init__(self, request):
+        self.response = api.ValidJSON()
+        self.response.data = api.Data()
+        self.response.data.flow = list()
+        self.response.data.message = list()
+        self.response.data.user = list()
+        self.response.errors = api.Errors()
+        self.response.jsonapi = api.Version()
+        self.response.jsonapi.version = config.API_VERSION
+        self.get_time = int(time())
 
-
-def get_userdata(username: str):
-    """The function checks the presence of the user in the database.
-
-    Args:
-        username (str): required
-
-    Returns:
-        bool: True or False
-    """
-    dbdata = models.User.select(models.User.q.username == username)
-    if dbdata.count() != 0:
-        return dbdata[0].password
-    else:
-        return None
-
-
-def save_message(message: dict) -> None:
-    """The function stores the message in the database.
-
-    Args:
-        message (dict): [description]
-
-    Returns:
-        None
-    """
-    user = models.User.select(models.User.q.username == message['username'])
-    models.Message(text=message['text'],
-                   userID=user[0].UUID,
-                   flowID=0,
-                   time=message['timestamp'])
-    return
-
-
-def get_messages() -> list:
-    """The function receives all the messages
-    from the database and converts them into a list.
-
-    Args:
-        No args.
-
-    Returns:
-        list: The list contains the following dictionary:
-        {
-            'mode': 'message',
-            'username': str,
-            'text': str,
-            'time': int
-        }
-    """
-    dbquery = models.Message.select(models.Message.q.id > 0)
-    messages = []
-    for data in dbquery:
-        user = models.User.select(models.User.q.UUID == data.userID)
-        messages.append({
-            "mode": "message",
-            "username": user[0].username,
-            "text": data.text,
-            "timestamp": data.time
-        })
-    return messages
-
-
-def register_user(request) -> dict:
-    """The function registers the user who is not in the database.
-
-    Note: This version also authentificate user, that exist in database
-    Future version will return error if login exist in database
-
-    Args:
-        request (class ValidJSON): required
-
-    Returns:
-        Dict: returns JSON reply to client
-    """
-    response = {
-        'type': 'register_user',
-        'errors': {
-            'status': 'Created',
-            'code': 201,
-            'detail': 'Registered successfully'
-        },
-        'jsonapi': {
-            'version': config.API_VERSION
-        },
-        'meta': None
-    }
-    if dbpassword := get_userdata(request.data.user.login):
-        if dbpassword == request.data.user.password:
-            # TODO
-            # generate authID: store and return to user
-            response['errors']['code'] = 200
-            response['errors']['status'] = 'Ok'
-            response['errors']['detail'] = 'Authentificated'
-            return response
+        try:
+            self.request = api.ValidJSON.parse_obj(request)
+        except ValidationError as error:
+            self.response.type = "errors"
+            self.__catching_error(415, error)
         else:
-            response['errors']['code'] = 401
-            response['errors']['status'] = 'Unauthorized'
-            response['errors']['detail'] = 'Bad username or password'
-            return response
-    else:
-        # TODO
-        # generate authID: store and return to user
-        # generate salt, and create hash password
-        userID = random.getrandbits(64)
-        models.User(UUID=userID,
-                    password=request.data.user.password,
-                    login=request.data.user.login,
-                    username=request.data.user.login)
-        return response
+            self.response.type = self.request.type
+            if self.request.type == 'register_user':
+                self._register_user()
+            elif self.request.type == 'auth':
+                self._authentification()
+            else:
+                if self.__check_auth_token(self.request.data.user[0].uuid,
+                                           self.request.data.user[0].auth_id):
+                    if self.request.type == 'send_message':
+                        self._send_message()
+                    elif self.request.type == 'all_flow':
+                        self._all_flow()
+                    elif self.request.type == 'add_flow':
+                        self._add_flow()
+                    elif self.request.type == 'all_messages':
+                        self._all_messages()
+                    elif self.request.type == 'delete_user':
+                        self._delete_user()
+                    elif self.request.type == 'delete_message':
+                        self._delete_message()
+                    elif self.request.type == 'edited_message':
+                        self._edited_message()
+                    elif self.request.type == "get_update":
+                        self._get_update()
+                    elif self.request.type == "ping-pong":
+                        self._ping_pong()
+                    elif self.request.type == 'user_info':
+                        self._user_info()
+                    else:
+                        self._errors()
+                else:
+                    self.__catching_error(401)
 
+    def get_response(self):
+        """Function generates a JSON-object containing result
+        of an instance of ProtocolMethod class.
 
-def serve_request(request_json) -> dict:
-    """The function try serve user request and return result status.
+        """
+        return self.response.toJSON()
 
-    Args:
-        No args.
+    def __check_auth_token(self, uuid: str, auth_id: str) -> bool:
+        """Function checks uuid and auth_id of user
 
-    Returns:
-        Response for sending to user  - successfully served
-        (error response - if any kind of problems)
-    """
-    try:
-        request = api.ValidJSON.parse_raw(request_json)
-    except api.ValidationError:
-        message = {
-            'type': 'error',
-            'errors': {
-                'time': time(),
-                'status': 'Bad Request',
-                'code': 400,
-                'detail': 'JSON validation error'
-            },
-            'jsonapi': {
-                'version': config.API_VERSION
-            },
-            'meta': None
-        }
-        return message
-    if request.type == 'register_user':
-        return register_user(request)
-    elif request.type == 'send_message':
-        return send_message(request)
-    elif request.type == 'all_flow':
-        return all_flow(request)
-    elif request.type == 'add_flow':
-        return add_flow(request)
-    else:
-        message = {
-            'type': request.type,
-            'errors': {
-                'time': time(),
-                'status': 'Bad Request',
-                'code': 400,
-                'detail': 'Method not supported by server'
-            },
-            'jsonapi': {
-                'version': config.API_VERSION
-            },
-            'meta': None
-        }
-        return message
+        Args:
+            uuid (int, requires): Unique User ID
+            auth_id (str, requires): authentification ID
 
+        Returns:
+            True if successful
+            False if unsuccessful
+        """
+        try:
+            dbquery = models.User.selectBy(uuid=uuid).getOne()
+        except (dberrors.OperationalError,
+                SQLObjectIntegrityError, SQLObjectNotFound):
+            return False
+        else:
+            if auth_id == dbquery.authId:
+                return True
+            else:
+                return False
 
-def get_update():
-    pass
+    def __check_login(self, login: str) -> bool:
+        """Provides information about all personal settings of user
+        (in a server-friendly form)
 
+        Args:
+            login (str, optional): user login
 
-def send_message(request) -> dict:
-    """The function saves user message in the database.
+        Returns:
+            True if there is such a user
+            False if no such user exists
+        """
+        try:
+            models.User.selectBy(login=login).getOne()
+        except (SQLObjectIntegrityError, SQLObjectNotFound):
+            return False
+        else:
+            return True
 
-    Args:
-        request (class ValidJSON): required
+    def __catching_error(self, code: Union[int, str],
+                         add_info: Optional[str] = None) -> None:
+        """Function catches errors in the "try...except" content.
+        Result is 'dict' with information about the code, status,
+        time and detailed description of the error that has occurred.
+        For errors like Exception and other unrecognized errors,
+        code "520" and status "Unknown Error" are used.
+        Function also automatically logs the error.
 
-    Returns:
-        Dict: returns JSON reply to client
-    """
-    response = {
-            'type': 'send_message',
-            'data': {
-                'time': time(),
-                'meta': None
-            },
-            'errors': {
-                'code': 200,
-                'status': 'OK',
-                'time': time(),
-                'detail': 'successfully'
-            },
-            'jsonapi': {
-                'version': config.API_VERSION
-            },
-            'meta': None
-    }
-    flowid = request.data.message.from_flow.id
-    user = models.User.select(models.User.q.username == request.data.user.login)
-    # TODO
-    # check existance of flow
-    # check if user is member of flow
-    # check can user send to channel
-    # check is user banned to write in group
-    models.Message(text=request.data.message.text,
-                   userID=user[0].UUID,
-                   flowID=flowid,
-                   time=time())
-    return response
+        Args:
+            code (Union[int, str]): Error code or type and exception
+            description.
+            add_info (Optional[str], optional): Additional information
+            to be added. The 'Exception' field is not used for exceptions.
+            Defaults to None.
 
+        Returns:
+            dict: returns 'dict' according to the protocol,
+                like: {
+                    'code': 200,
+                    'status': 'Ok',
+                    'time': 123456545,
+                    'detail': 'successfully'
+                    }
+        """
+        if code in config.DICT_ERRORS:
+            if add_info is None:
+                add_info = config.DICT_ERRORS[code]['detail']
+            self.response.errors.code = code
+            self.response.errors.status = config.DICT_ERRORS[code]['status']
+            self.response.errors.time = self.get_time
+            self.response.errors.detail = add_info
+        else:
+            self.response.errors.code = 520
+            self.response.errors.status = 'Unknown Error'
+            self.response.errors.time = self.get_time
+            self.response.errors.detail = code
 
-def all_message():
-    pass
+    def _register_user(self):
+        """The function registers the user who is not in the database.
+        Note: This version also authentificate user, that exist in database
+        Future version will return error if login exist in database
 
+        """
+        # FIXME после замены uuid на UUID из питоньего модуля
+        random.seed(urandom(64))
+        gen_uuid = random.randrange(10000, 999999999999)
+        if self.__check_login(self.request.data.user[0].login):
+            self.__catching_error(409)
+        else:
+            generated = lib.Hash(password=self.request.data.user[0].password,
+                                 uuid=gen_uuid)
+            models.User(uuid=gen_uuid,
+                        password=self.request.data.user[0].password,
+                        hashPassword=generated.password_hash(),
+                        login=self.request.data.user[0].login,
+                        key=generated.get_key(),
+                        salt=generated.get_salt(),
+                        authId=(gen_auth_id := generated.auth_id()))
+            user = api.User()
+            user.uuid = gen_uuid
+            user.auth_id = gen_auth_id
+            self.response.data.user.append(user)
+            self.__catching_error(201)
 
-def add_flow(type_f, title_f, info_f):
-    id_f = random.getrandbits(64)
-    models.Flow(flowId=id_f,
-                timeCreated=time(),
-                flowType=type_f,
-                title=title_f,
-                info=info_f
-                )
-    message = {
-        'type': 'add_flow',
-        'data': {
-            'time': time(),
-            'meta': None
-        },
-        'errors': {
-            'code': 200,
-            'status': 'OK',
-            'time': 1594492370,
-            'detail': 'successfully'
-        },
-        'jsonapi': {
-            'version': '1.0'
-        },
-        'meta': None
-    }
-    return message
+    def _get_update(self):
+        """The function displays messages of a specific flow,
+        from the timestamp recorded in the request to the server timestamp,
+        retrieves them from the database
+        and issues them as an array consisting of JSON
 
+        """
+        # TODO внеести измнения в протокол, добавить фильтр
+        # по дате создания пользователя
+        dbquery_user = models.User.selectBy()
+        dbquery_flow = models.Flow.select(models.Flow.q.timeCreated >=
+                                          self.request.data.time)
+        dbquery_message = models.Message.select(models.Message.q.time >=
+                                                self.request.data.time)
+        if dbquery_message.count():
+            for element in dbquery_message:
+                message = api.Message()
+                message.text = element.text
+                message.time = element.time
+                message.emoji = element.emoji
+                message.file_picture = element.filePicture
+                message.file_video = element.fileVideo
+                message.file_audio = element.fileAudio
+                message.file_document = element.fileDocument
+                message.from_user_uuid = element.userID
+                message.from_flow_id = element.flowID
+                message.edited_status = element.editedStatus
+                self.response.data.message.append(message)
+        elif dbquery_flow.count():
+            for element in dbquery_flow:
+                flow = api.Flow()
+                flow.id = element.flowId
+                flow.time = element.timeCreated
+                flow.type = element.flowType
+                flow.title = element.title
+                flow.info = element.info
+                self.response.data.flow.append(flow)
+        elif dbquery_user.count():
+            for element in dbquery_user:
+                user = api.User()
+                user.uuid = element.uuid
+                user.username = element.username
+                user.is_bot = element.isBot
+                user.avatar = element.avatar
+                user.bio = element.bio
+                self.response.data.user.append(user)
+        else:
+            self.__catching_error(404)
+        self.__catching_error(200)
 
-def all_flow():
-    flow_list = []
-    dbquery = models.Flow.select(models.Flow.q.id > 0)
-    for db_flow in dbquery:
-        data_flow = {
-           "flowId": db_flow.flowId,
-           "timeCreated": db_flow.timeCreated,
-           "flowType": db_flow.flowType,
-           "title": db_flow.title,
-           "info": db_flow.info
-        }
-        flow_list.append(data_flow)
-    message = {
-        'type': 'all_flow',
-        'data': {
-            'time': time(),
-            'flows': flow_list,
-            'meta': None
-        },
-        'errors': {
-            'code': 200,
-            'status': 'OK',
-            'time': 1594492370,
-            'detail': 'successfully'
-        },
-        'jsonapi': {
-            'version': '1.0'
-        },
-        'meta': None
-    }
-    return message
+    def _send_message(self):
+        """The function saves user message in the database.
 
+        """
+        try:
+            models.Flow.selectBy(flowId=self.request.data.flow[0].id).getOne()
+        except SQLObjectNotFound as flow_error:
+            self.__catching_error(404, flow_error)
+        else:
+            models.Message(text=self.request.data.message[0].text,
+                           time=self.get_time,
+                           filePicture=self.request.data.message[0].file_picture,
+                           fileVideo=self.request.data.message[0].file_video,
+                           fileAudio=self.request.data.message[0].file_audio,
+                           fileDocument=self.request.data.message[0].file_audio,
+                           emoji=self.request.data.message[0].emoji,
+                           editedTime=self.request.data.message[0].edited_time,
+                           editedStatus=self.request.data.
+                           message[0].edited_status,
+                           user=self.request.data.user[0].uuid,
+                           flow=self.request.data.flow[0].id)
+            self.__catching_error(200)
 
-def user_info(request: api.ValidJSON) -> dict:
-    """This function provides information about all personal settings of the user.
+    def _add_flow(self):
+        """Function allows you to add a new flow to the database
 
-    Args:
-        request (api.ValidJSON): client request - a set of data that was
-        validated by "pydantic".
+        """
+        # FIXME после замены flowId на UUID из питоньего модуля
+        random.seed(urandom(64))
+        flow_id = random.randrange(1, 999999)
+        try:
+            models.Flow(flowId=flow_id,
+                        timeCreated=self.get_time,
+                        flowType=self.request.data.flow[0].type,
+                        title=self.request.data.flow[0].title,
+                        info=self.request.data.flow[0].info)
+        except SQLObjectIntegrityError as flow_error:
+            self.__catching_error(520, flow_error)
+        else:
+            flow = api.Flow()
+            flow.id = flow_id
+            flow.time = self.get_time
+            flow.type = self.request.data.flow[0].type
+            flow.title = self.request.data.flow[0].title
+            flow.info = self.request.data.flow[0].info
+            self.response.data.flow.append(flow)
+            self.__catching_error(200)
 
-    Returns:
-        dict: [description]
-    """
-    get_time = time()
-    response = request.dict(include={'type'})
-    if dbquery := models.User(models.User.q.select == request.data.user.UUID):
-        data = {
-            'data': {
-                'time': get_time,
-                'user': {
-                    'UUID': dbquery[0].UUID,
-                    'login': dbquery[0].login,
-                    'password': dbquery[0].password,
-                    'username': dbquery[0].username,
-                    'is_bot': dbquery[0].isBot,
-                    'auth_id': dbquery[0].authId,
-                    'email': dbquery[0].email,
-                    'avatar': dbquery[0].avatar,
-                    'bio': dbquery[0].bio
-                    },
-                'meta': None
-                },
-            'errors': {
-                'code': 200,
-                'status': 'OK',
-                'time': get_time,
-                'detail': 'successfully'
-                }
-            }
-        response.update(data)
-    else:
-        data = {
-            'errors': {
-                'code': 404,
-                'status': 'Not Found',
-                'time': get_time,
-                'detail': 'User Not Found'
-            }
-        }
-        response.update(data)
+    def _all_flow(self):
+        """Function allows to get a list of all flows and
+        information about them from the database
 
-    jsonapi = {
-        'jsonapi': {
-            'version': config.API_VERSION
-        },
-        'meta': None
-    }
-    response.update(jsonapi)
-    return response
+        """
+        dbquery = models.Flow.select(models.Flow.q.flowId >= 1)
+        if dbquery.count():
+            for element in dbquery:
+                flow = api.Flow()
+                flow.id = element.flowId
+                flow.time = element.timeCreated
+                flow.type = element.flowType
+                flow.title = element.title
+                flow.info = element.info
+                self.response.data.flow.append(flow)
+            self.__catching_error(200)
+        else:
+            self.__catching_error(404)
 
+    def _user_info(self):
+        """Provides information about all personal settings of user.
 
-def authentication():
-    pass
+        """
+        try:
+            dbquery = models.User.selectBy(uuid=self.request.data.user[0].uuid).getOne()
+        except (SQLObjectIntegrityError, SQLObjectNotFound) as user_info_error:
+            self.__catching_error(404, user_info_error)
+        else:
+            user = api.User()
+            user.uuid = dbquery.uuid
+            user.login = dbquery.login
+            user.username = dbquery.username
+            user.is_bot = dbquery.isBot
+            user.email = dbquery.email
+            user.avatar = dbquery.avatar
+            user.bio = dbquery.bio
+            self.response.data.user.append(user)
+            self.__catching_error(200)
 
+    def _authentification(self):
+        """Performs authentification of registered client,
+        with issuance of a unique hash number of connection session.
+        During authentification password transmitted by client
+        and password contained in server database are verified.
 
-def delete_user():
-    pass
+        """
+        if self.__check_login(self.request.data.user[0].login) is False:
+            self.__catching_error(404)
+        else:
+            dbquery = models.User.selectBy(login=self.request.data.user[0].login).getOne()
+            generator = lib.Hash(password=self.request.data.user[0].password,
+                                 uuid=dbquery.uuid,
+                                 salt=dbquery.salt,
+                                 key=dbquery.key,
+                                 hash_password=dbquery.hashPassword)
+            if generator.check_password():
+                dbquery.authId = generator.auth_id()
+                user = api.User()
+                user.uuid = dbquery.uuid
+                user.auth_id = dbquery.authId
+                self.response.data.user.append(user)
+                self.__catching_error(200)
+            else:
+                self.__catching_error(401)
 
+    def _delete_user(self):
+        """Function irretrievably deletes the user from the database.
 
-def delete_message():
-    pass
+        """
+        try:
+            dbquery = models.User.selectBy(login=self.request.data.user[0].login,
+                                           password=self.request.data.user[0].password).getOne()
+        except (SQLObjectIntegrityError, SQLObjectNotFound) as not_found:
+            self.__catching_error(404, not_found)
+        else:
+            dbquery.delete(dbquery.id)
+            self.__catching_error(200)
 
+    def _delete_message(self):
+        """Function deletes the message from the database Message table by its ID.
 
-def edited_message():
-    pass
+        """
+        try:
+            dbquery = models.Message.selectBy(id=self.request.data.message[0].id).getOne()
+        except (SQLObjectIntegrityError, SQLObjectNotFound) as not_found:
+            self.__catching_error(404, not_found)
+        else:
+            dbquery.delete(dbquery.id)
+            self.__catching_error(200)
 
+    def _edited_message(self):
+        """Function changes the text and time in the database Message table.
+        The value of the editedStatus column changes from None to True.
 
-def ping_pong():
-    pass
+        """
+        try:
+            dbquery = models.Message.selectBy(id=self.request.data.message[0].id).getOne()
+        except (SQLObjectIntegrityError, SQLObjectNotFound) as not_found:
+            self.__catching_error(404, not_found)
+        else:
+            # changing in DB text, time and status
+            dbquery.text = self.request.data.message[0].text
+            dbquery.editedTime = self.get_time
+            dbquery.editedStatus = True
+            self.__catching_error(200)
+
+    def _all_messages(self):
+        """Function displays all messages of a specific flow retrieves them
+        from the database and issues them as an array consisting of JSON
+
+        """
+        dbquery = models.Message.select(
+            AND(models.Message.q.flowID == self.request.data.flow[0].id,
+                models.Message.q.time >= self.request.data.time))
+        if dbquery.count():
+            for element in dbquery:
+                message = api.Message()
+                message.from_flow_id = element.flowID
+                message.from_user_uuid = element.userID
+                message.text = element.text
+                message.time = element.time
+                message.file_picture = element.filePicture
+                message.file_video = element.fileVideo
+                message.file_audio = element.fileAudio
+                message.file_document = element.fileDocument
+                message.emoji = element.emoji
+                message.edited_time = element.editedTime
+                message.edited_status = element.editedStatus
+                self.response.data.message.append(message)
+            self.__catching_error(200)
+        else:
+            self.__catching_error(404)
+
+    def _ping_pong(self):
+        """The function generates a response to a client's request
+        for communication between the server and the client.
+
+        """
+        self.__catching_error(200)
+
+    def _errors(self):
+        """Function handles cases when a request to server is not recognized by it.
+        You get a standard answer type: error, which contains an object
+        with a description of the error.
+
+        """
+        self.__catching_error(405)
